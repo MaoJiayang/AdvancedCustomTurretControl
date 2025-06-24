@@ -1,0 +1,773 @@
+using System;
+using System.Collections.Generic;
+using VRageMath;
+using Sandbox.ModAPI.Ingame;
+
+namespace IngameScript
+{
+    /// <summary>
+    /// 用于存储目标数据的结构（因无法直接构造 MyDetectedEntityInfo，因此自定义）
+    /// </summary>
+    public struct SimpleTargetInfo
+    {
+        public Vector3D Position;
+        public Vector3D Velocity;
+        public long TimeStamp; // 以毫秒为单位
+        public SimpleTargetInfo(Vector3D position, Vector3D velocity, long timeStamp)
+        {
+            Position = position;
+            Velocity = velocity;
+            TimeStamp = timeStamp;
+        }
+
+        // 从 MyDetectedEntityInfo 创建
+        public static SimpleTargetInfo FromDetectedInfo(MyDetectedEntityInfo info)
+        {
+            return new SimpleTargetInfo(
+                info.Position,
+                new Vector3D(info.Velocity),
+                info.TimeStamp
+            );
+        }
+    }
+    /// <summary>
+    /// 圆周运动参数结构
+    /// </summary>
+    public struct CircularMotionParams
+    {
+        public Vector3D Center;
+        public double Radius;
+        public double AngularVelocity;
+        public Vector3D PlaneNormal;
+        public bool IsValid;
+        
+        public CircularMotionParams(Vector3D center, double radius, double angularVel, Vector3D normal)
+        {
+            Center = center;
+            Radius = radius;
+            AngularVelocity = angularVel;
+            PlaneNormal = normal;
+            IsValid = true;
+        }
+        
+        public static CircularMotionParams Invalid => new CircularMotionParams { IsValid = false };
+    }
+
+    public partial class TargetTracker : MyGridProgram
+    {
+        #region Fields and Constants
+
+        public double circlingRadius = 0; // 目标当前环绕半径
+        public double polyWeight, circularWeight, linearWeight;
+        public double polyPositionError, circularPositionError, linearPositionError, combinationError;
+        // 目标历史记录最大长度
+        private readonly int _maxHistory;
+        // 目标历史记录，最新数据放在链表头部
+        private readonly CircularQueue<SimpleTargetInfo> _history;
+        private CircularMotionParams _circularMotionParams; // 圆周运动参数
+        private int _updateCount = 0; // 更新计数器，用于记录历史记录的更新次数
+
+        // 常量定义
+        private const double TimeEpsilon = 1e-6; // 时间差最小值
+        private const double LinearThreshold = 1; // 线性运动检测阈值
+        private const double RadiusThreshold = 1e6; // 半径过大阈值
+    
+        #endregion
+
+        #region Constructors
+
+        /// <summary>
+        /// 默认构造函数
+        /// </summary>
+        public TargetTracker() : this(30) { }
+
+        /// <summary>
+        /// 构造函数，可自定义目标历史最大长度
+        /// </summary>
+        /// <param name="maxHistory">目标历史记录最大长度</param>
+        public TargetTracker(int maxHistory)
+        {
+            _maxHistory = maxHistory;
+            _history = new CircularQueue<SimpleTargetInfo>(_maxHistory);
+        }
+
+        #endregion
+
+        #region Public Methods
+
+        /// <summary>
+        /// 添加一条新的目标数据到历史记录中，超过最大长度时自动清除最旧数据
+        /// </summary>
+        public void UpdateTarget(SimpleTargetInfo target,bool hasVelocityAvailable = false)
+        {
+            _updateCount = (_updateCount + 1) % 2147483647;
+            _history.AddFirst(target);
+            EvaluatePredictionPerformance(hasVelocityAvailable);
+
+            int historyLength = _history.Count;
+            int index2 = historyLength / 2;
+            var p0 = _history.First;
+            var p1 = _history.GetItemAt(index2);
+            var p2 = _history.Last;
+            _circularMotionParams = CalculateCircularMotionParams(p0, p1, p2); 
+                       
+        }
+
+        public void UpdateTarget(MyDetectedEntityInfo target)
+        {
+            UpdateTarget(SimpleTargetInfo.FromDetectedInfo(target));
+        }
+
+        public void UpdateTarget(Vector3D position, Vector3D velocity, long timeStamp)
+        {
+            UpdateTarget(new SimpleTargetInfo(position, velocity, timeStamp));
+        }
+
+        /// <summary>
+        /// 清空目标历史记录
+        /// </summary>
+        public void ClearHistory()
+        {
+            _history.Clear();
+        }
+        /// <summary>
+        /// 返回当前历史记录中最新的目标数据（若存在）
+        /// </summary>
+        public SimpleTargetInfo? GetLatestTargetInfo()
+        {
+            return _history.Count > 0 ? _history.First : (SimpleTargetInfo?)null;
+        }
+
+        public Vector3D GetLatestPosition()
+        {
+            return _history.Count > 0 ? _history.First.Position : Vector3D.Zero;
+        }
+
+        public long GetLatestTimeStamp()
+        {
+            return _history.Count > 0 ? _history.First.TimeStamp : 0;
+        }
+        public int GetHistoryCount() => _history.Count;
+        /// <summary>
+        /// 预测未来目标信息（使用加权组合）
+        /// </summary>
+        /// <param name="futureTimeMs">预测时间间隔（毫秒）</param>
+        /// <param name="hasVelocityAvailable">是否有实测速度信息</param>
+        /// <returns>预测的目标信息</returns>
+        public SimpleTargetInfo PredictFutureTargetInfo(long futureTimeMs, bool hasVelocityAvailable = false)
+        {
+            if (_history.Count == 0)
+            {
+                return new SimpleTargetInfo(Vector3D.Zero, Vector3D.Zero, 0);
+            }
+
+            if (_history.Count <= 2)
+            {
+                // 1-2个数据点，使用匀速运动预测
+                return PredictUniformMotion(futureTimeMs, hasVelocityAvailable, _history.First);
+            }
+
+            // 获取历史数据点
+            int historyLength = _history.Count;
+            int index2 = historyLength / 2;
+            var p0 = _history.First;
+            var pm = _history.GetItemAt(index2);
+            var pt = _history.Last;
+            // var p1 = _history.GetItemAt(1);
+            // var p2 = _history.GetItemAt(2);
+
+            // 检查权重，避免不必要的计算
+            bool usePoly = Math.Abs(polyWeight) > 1e-3;
+            bool useCircular = Math.Abs(circularWeight) > 1e-3;
+            bool useLinear = Math.Abs(linearWeight) > 1e-3;
+
+            SimpleTargetInfo polyPrediction, circularPrediction, linearPrediction;
+
+            // 只计算需要的预测
+            if (usePoly && useCircular && useLinear)
+            {
+                // 预测都需要，进行加权组合
+                polyPrediction = PredictSecondOrder(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
+                circularPrediction = PredictCircularMotion(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
+                linearPrediction = PredictUniformMotion(futureTimeMs, hasVelocityAvailable, pm);
+
+                Vector3D combinedPosition = polyPrediction.Position * polyWeight + circularPrediction.Position * circularWeight + linearPrediction.Position * linearWeight;
+                Vector3D combinedVelocity = polyPrediction.Velocity * polyWeight + circularPrediction.Velocity * circularWeight + linearPrediction.Velocity * linearWeight;
+
+                return new SimpleTargetInfo(combinedPosition, combinedVelocity, p0.TimeStamp + futureTimeMs);
+            }
+            else if (usePoly)
+            {
+                // 只使用多项式预测
+                return PredictSecondOrder(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
+            }
+            else if (useCircular)
+            {
+                // 只使用圆周预测
+                return PredictCircularMotion(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
+            }
+            else
+            {
+                // 两个权重都很小，使用多项式预测作为默认
+                return PredictSecondOrder(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
+            }
+        }
+        #endregion
+
+        #region Prediction Models
+
+        /// <summary>
+        /// 匀速运动预测（适用于1-2个数据点）
+        /// 没有速度可供使用时，使用位置差计算速度。有速度时，
+        /// </summary>
+        private SimpleTargetInfo PredictUniformMotion(long futureTimeMs, bool hasVelocityAvailable, SimpleTargetInfo p0, SimpleTargetInfo? p1 = null)
+        {
+            double dt = futureTimeMs * 0.001;
+            if (hasVelocityAvailable)
+            {
+                // 如果有实测速度，直接使用
+                return new SimpleTargetInfo(p0.Position + p0.Velocity * dt, p0.Velocity, p0.TimeStamp + futureTimeMs);
+            }
+            
+            // 检查p1是否被提供
+            SimpleTargetInfo previousPoint;
+            double timeDiff;
+            
+            if (p1.HasValue && p1.Value.TimeStamp > 0)
+            {
+                // 使用提供的p1
+                previousPoint = p1.Value;
+                timeDiff = ClampTime((p0.TimeStamp - previousPoint.TimeStamp) * 0.001);
+            }
+            else if (_history.Count > 1)
+            {
+                // 从历史记录中获取第二个点
+                previousPoint = _history.GetItemAt(1);
+                timeDiff = ClampTime((p0.TimeStamp - previousPoint.TimeStamp) * 0.001);
+            }
+            else
+            {
+                // 没有可用的前一个点，无法计算速度
+                return new SimpleTargetInfo(p0.Position, p0.Velocity, p0.TimeStamp + futureTimeMs);
+            }
+            
+            if (timeDiff < TimeEpsilon)
+            {
+                // 时间差过小，无法计算速度
+                return new SimpleTargetInfo(p0.Position, p0.Velocity, p0.TimeStamp + futureTimeMs);
+            }
+            
+            // 计算速度
+            Vector3D velocity = (p0.Position - previousPoint.Position) / timeDiff;
+            Vector3D predictedPos = p0.Position + velocity * dt;
+            return new SimpleTargetInfo(predictedPos, velocity, p0.TimeStamp + futureTimeMs);
+        }
+        /// <summary>
+        /// 二阶预测（基于三个或以上数据点）
+        /// </summary>
+        private SimpleTargetInfo PredictSecondOrder(long futureTimeMs, bool hasVelocityAvailable, SimpleTargetInfo p0, SimpleTargetInfo p1, SimpleTargetInfo p2)
+        {
+            // 计算时间间隔
+            double dt1 = ClampTime((p0.TimeStamp - p1.TimeStamp) * 0.001);
+            double dt2 = ClampTime((p1.TimeStamp - p2.TimeStamp) * 0.001);
+
+            Vector3D currentPos = p0.Position;
+            Vector3D currentVel, acceleration, jerk = Vector3D.Zero;
+            bool useThirdOrder = false; // 是否使用三阶预测
+
+            if (hasVelocityAvailable)
+            {
+                // 使用实测速度计算加速度
+                currentVel = p0.Velocity;
+
+                Vector3D acc1 = (p0.Velocity - p1.Velocity) / dt1;
+                Vector3D acc2 = (p1.Velocity - p2.Velocity) / dt2;
+
+                // 计算加速度变化率(jerk)
+                jerk = (acc1 - acc2) / (dt1 + dt2 * 0.5); // 加权时间差
+                useThirdOrder = true;  // 有足够信息使用三阶预测
+
+                // 取当前加速度
+                acceleration = acc1;
+            }
+            else
+            {
+                // 通过位置计算速度和加速度
+                Vector3D vel1 = (p0.Position - p1.Position) / dt1;
+                Vector3D vel2 = (p1.Position - p2.Position) / dt2;
+
+                currentVel = vel1;
+                acceleration = (vel1 - vel2) / dt1;
+            }
+
+            // 预测计算
+            double dt_predict = futureTimeMs * 0.001;
+            Vector3D predictedPos, predictedVel;
+            
+            if (useThirdOrder)
+            {
+                // 三阶预测：p = p₀ + v₀·t + ½·a₀·t² + ⅙·j·t³
+                predictedPos = currentPos + 
+                            currentVel * dt_predict + 
+                            0.5 * acceleration * dt_predict * dt_predict +
+                            (1.0/6.0) * jerk * dt_predict * dt_predict * dt_predict;
+                            
+                // 预测速度：v = v₀ + a₀·t + ½·j·t²
+                predictedVel = currentVel + 
+                            acceleration * dt_predict +
+                            0.5 * jerk * dt_predict * dt_predict;
+            }
+            else
+            {
+                // 原有的二阶预测
+                predictedPos = currentPos + currentVel * dt_predict + 0.5 * acceleration * dt_predict * dt_predict;
+                predictedVel = currentVel + acceleration * dt_predict;
+            }
+
+            return new SimpleTargetInfo(predictedPos, predictedVel, p0.TimeStamp + futureTimeMs);
+        }
+
+        /// <summary>
+        /// 计算圆周运动参数
+        /// </summary>
+        /// <param name="p0">最新位置点</param>
+        /// <param name="p1">第二新位置点</param>
+        /// <param name="p2">第三新位置点</param>
+        /// <returns>圆周运动参数</returns>
+        private CircularMotionParams CalculateCircularMotionParams(SimpleTargetInfo p0, SimpleTargetInfo p1, SimpleTargetInfo p2)
+        {
+            // 检测是否为线性运动
+            Vector3D a = p1.Position - p0.Position;
+            Vector3D b = p2.Position - p0.Position;
+            Vector3D cross = Vector3D.Cross(a, b);
+
+            if (cross.LengthSquared() < LinearThreshold)
+            {
+                return CircularMotionParams.Invalid; // 直线运动
+            }
+
+            // 计算外接圆参数
+            try
+            {
+                double crossLenSq = cross.LengthSquared();
+                double a_len_sq = a.LengthSquared();
+                double b_len_sq = b.LengthSquared();
+
+                Vector3D alpha = Vector3D.Cross(b, cross) * a_len_sq;
+                Vector3D beta = Vector3D.Cross(cross, a) * b_len_sq;
+                Vector3D center = p0.Position + (alpha + beta) / (2.0 * crossLenSq);
+
+                double radius = (center - p0.Position).Length();
+                circlingRadius = radius; // 更新当前环绕半径
+
+                // 半径过大时视为无效圆周运动
+                if (radius > RadiusThreshold)
+                {
+                    return CircularMotionParams.Invalid;
+                }
+
+                // 计算角速度
+                Vector3D r1 = p0.Position - center;
+                Vector3D r2 = p1.Position - center;
+
+                double r1_len = r1.Length();
+                double r2_len = r2.Length();
+
+                if (r1_len < TimeEpsilon || r2_len < TimeEpsilon)
+                {
+                    return CircularMotionParams.Invalid;
+                }
+
+                double cosAngle = Math.Max(-1.0, Math.Min(1.0, Vector3D.Dot(r1, r2) / (r1_len * r2_len)));
+                double angle = Math.Acos(cosAngle);
+                double dt_sample = ClampTime((p0.TimeStamp - p1.TimeStamp) * 0.001);
+                double angularVelocity = angle / dt_sample;
+
+                // 计算运动平面法向量
+                Vector3D planeNormal = Vector3D.Normalize(cross);
+
+                return new CircularMotionParams(center, radius, angularVelocity, planeNormal);
+            }
+            catch
+            {
+                return CircularMotionParams.Invalid;
+            }
+        }
+
+        /// <summary>
+        /// 基于圆周运动模型预测未来目标信息
+        /// </summary>
+        /// <param name="futureTimeMs">预测时间间隔（毫秒）</param>
+        /// <param name="hasVelocityAvailable">是否有实测速度信息</param>
+        /// <param name="p0">最新位置点</param>
+        /// <param name="p1">第二新位置点</param>
+        /// <param name="p2">第三新位置点</param>
+        /// <returns>基于圆周运动模型的预测结果</returns>
+        private SimpleTargetInfo PredictCircularMotion(long futureTimeMs, bool hasVelocityAvailable, SimpleTargetInfo p0, SimpleTargetInfo p1, SimpleTargetInfo p2)
+        {
+            // 计算圆周运动参数
+            var circularParams = _circularMotionParams;
+
+            // 获取当前速度
+            Vector3D currentVel = GetCurrentVelocity(p0, p1, hasVelocityAvailable);
+
+            // 如果不是有效的圆周运动，退化为匀速预测
+            if (!circularParams.IsValid) return PredictSecondOrder(futureTimeMs, hasVelocityAvailable, p0, p1, p2);
+
+            // 预测未来位置
+            double dt_predict = futureTimeMs * 0.001;
+            double angleChange = circularParams.AngularVelocity * dt_predict;
+
+            // 确定旋转方向
+            Vector3D currentRadius = p0.Position - circularParams.Center;
+            Vector3D expectedVelDirection = Vector3D.Cross(circularParams.PlaneNormal, currentRadius);
+
+            if (Vector3D.Dot(currentVel, expectedVelDirection) < 0)
+            {
+                angleChange = -angleChange;
+            }
+
+            // 使用四元数旋转预测位置
+            QuaternionD rotation = QuaternionD.CreateFromAxisAngle(circularParams.PlaneNormal, angleChange);
+            Vector3D rotatedRadius = Vector3D.Transform(currentRadius, rotation);
+            Vector3D predictedPos = circularParams.Center + rotatedRadius;
+
+            // 预测速度（旋转当前速度向量）
+            Vector3D predictedVel = Vector3D.Transform(currentVel, rotation);
+
+            return new SimpleTargetInfo(predictedPos, predictedVel, p0.TimeStamp + futureTimeMs);
+        }
+
+        /// <summary>
+        /// 衡量预测性能的方法-可学习参数
+        /// </summary>
+        /// <param name="hasVelocityAvailable">是否有实测速度信息</param>
+        /// <returns>预测误差的模长，如果数据不足则返回-1</returns>
+        private void EvaluatePredictionPerformance(bool hasVelocityAvailable = false)
+        {
+            // 历史记录检查（保持原有代码）
+            if (_history.Count < 4)
+            {
+                polyPositionError = 1145140721.0;
+                circularPositionError = 1145140721.0;
+                combinationError = 1145140721.0;
+                return;
+            }
+
+            // 获取历史数据点（保持原有代码）
+            int historyLength = _history.Count;
+            int index3_1 = historyLength / 3;
+            int index3_2 = historyLength * 2 / 3;
+            if (index3_1 == 0) index3_1 = 1;
+            if (index3_2 <= index3_1) index3_2 = index3_1 + 1;
+
+            // historyLength = historyLength / 4; // 取1/4长度，避免过长历史记录影响快速响应
+            // int index1 = historyLength / 3;
+            // int index2 = historyLength * 2 / 3;
+            // if (index1 == 0) index1 = 1;
+            // if (index2 <= index1) index2 = index1 + 1;
+
+            var p0 = _history.First; // 最新记录
+            // var p1 = _history.GetItemAt(1); // 第二新记录
+            // var p2 = _history.GetItemAt(2); // 第三新记录
+            // var p3 = _history.GetItemAt(3); // 最旧记录
+            var p3_1 = _history.GetItemAt(index3_1); // 大约1/3处
+            var p3_2 = _history.GetItemAt(index3_2); // 大约2/3处
+            var pt = _history.Last; // 最旧记录
+
+            // 计算预测时间
+            long predictionTimeCicular = p0.TimeStamp - p3_1.TimeStamp;
+            long predictionTimePoly = p0.TimeStamp - p3_1.TimeStamp;
+            long predictionTimeLinear = p0.TimeStamp - p3_1.TimeStamp;
+
+            // 进行预测
+            SimpleTargetInfo predictedPolyTarget = PredictSecondOrder(predictionTimePoly, hasVelocityAvailable, p3_1, p3_2, pt);
+            _circularMotionParams = CalculateCircularMotionParams(p3_1, p3_2, pt); 
+            SimpleTargetInfo predictedCircularTarget = PredictCircularMotion(predictionTimeCicular, hasVelocityAvailable, p3_1, p3_2, pt);
+            SimpleTargetInfo predictedLinearTarget = PredictUniformMotion(predictionTimeLinear, hasVelocityAvailable, p3_1, p3_2);
+
+            // 计算各自的误差
+            polyPositionError = (predictedPolyTarget.Position - p0.Position).Length() / predictionTimePoly * 1000;
+            circularPositionError = (predictedCircularTarget.Position - p0.Position).Length() / predictionTimeCicular * 1000;
+            linearPositionError = (predictedLinearTarget.Position - p0.Position).Length() / predictionTimeLinear * 1000;
+            
+            // ----- 增量学习 -----
+
+            // 学习参数
+            double learningRate = 0.05;   // 控制每次更新的影响强度
+
+            // 计算误差比率与目标权重
+            double targetPolyWeight, targetCircularWeight, targetLinearWeight;
+            
+            // 基于误差比例计算目标权重
+            double errorSum = polyPositionError + circularPositionError + linearPositionError;
+            // 误差越小，权重越大（反比关系）
+            targetPolyWeight = (circularPositionError + linearPositionError) / errorSum;
+            targetCircularWeight = (polyPositionError + linearPositionError) / errorSum;
+            targetLinearWeight = (polyPositionError + circularPositionError) / errorSum;
+
+            // 使用学习率应用增量更新
+            polyWeight = polyWeight * (1 - learningRate) + targetPolyWeight * learningRate;
+            circularWeight = circularWeight * (1 - learningRate) + targetCircularWeight * learningRate;
+            linearWeight = linearWeight * (1 - learningRate) + targetLinearWeight * learningRate;
+
+            // 归一化确保权重和为1
+            double weightSum = polyWeight + circularWeight + linearWeight;
+            if (weightSum > 0)
+            {
+                polyWeight /= weightSum;
+                circularWeight /= weightSum;
+                linearWeight /= weightSum;
+            }
+            else
+            {
+                // 防御性编程
+                polyWeight = 1;
+                circularWeight = 0;
+                linearWeight = 0;
+            }
+
+            // 计算组合预测误差
+            Vector3D combinedPosition = predictedPolyTarget.Position * polyWeight + 
+                                    predictedCircularTarget.Position * circularWeight + 
+                                    predictedLinearTarget.Position * linearWeight;
+            combinationError = (combinedPosition - p0.Position).Length() / predictionTimeCicular * 1000;
+            
+            // 异常保护 - 找出误差最小的模型
+            double minIndividualError = Math.Min(Math.Min(polyPositionError, circularPositionError), linearPositionError);
+
+            if (combinationError > minIndividualError)
+            {
+                // 重置所有权重为0
+                polyWeight = 0.0;
+                circularWeight = 0.0;
+                linearWeight = 0.0;
+                
+                // 判断哪个模型误差最小
+                if (polyPositionError <= circularPositionError && polyPositionError <= linearPositionError)
+                {
+                    // 多项式模型最佳
+                    polyWeight = 1.0;
+                    combinationError = polyPositionError;
+                }
+                else if (circularPositionError <= polyPositionError && circularPositionError <= linearPositionError)
+                {
+                    // 圆周模型最佳
+                    circularWeight = 1.0;
+                    combinationError = circularPositionError;
+                }
+                else
+                {
+                    // 线性模型最佳
+                    linearWeight = 1.0;
+                    combinationError = linearPositionError;
+                }
+            }
+        }
+        // /// <summary>
+        // /// 衡量预测性能的方法-数值版
+        // /// </summary>
+        // /// <param name="hasVelocityAvailable">是否有实测速度信息</param>
+        // /// <returns>预测误差的模长，如果数据不足则返回-1</returns>
+        // private void EvaluatePredictionPerformance(bool hasVelocityAvailable = false)
+        // {
+        //     if (_history.Count < 4)
+        //     {
+        //         linearPositionError = 114514.0;
+        //         circularPositionError = 114514.0;
+        //         combinationError = 114514.0;
+        //         return;
+        //     }
+
+        // int historyLength = _history.Count;
+        // // 计算均匀分布的索引位置
+        // int index2 = historyLength / 3;              // 大约1/3处
+        // int index3 = historyLength * 2 / 3;          // 大约2/3处
+        // // 确保索引不重复
+        // if (index2 == 0) index2 = 1;
+        // if (index3 <= index2) index3 = index2 + 1;
+
+        // // 获取节点1（最新记录）
+        // var node1 = _history.First;
+        // // 获取节点2
+        // var node2 = _history.First;
+        // for (int i = 0; i < index2; i++)
+        //     node2 = node2.Next;
+        // // 获取节点3
+        // var node3 = _history.First;
+        // for (int i = 0; i < index3; i++)
+        //     node3 = node3.Next;
+        // // 获取节点4（最旧记录）
+        // var node4 = _history.Last;
+
+        // var p1 = node1.Value;
+        // var p2 = node2.Value;
+        // var p3 = node3.Value;
+        // var p4 = node4.Value;
+
+        //     // 计算从记录2时刻到记录1时刻的预测时间
+        //     long predictionTime = p1.TimeStamp - p2.TimeStamp;
+
+        //     // 使用记录2,3,4预测记录1时刻的位置（不依赖类的历史记录状态）
+        //     SimpleTargetInfo predictedLinearTarget = PredictSecondOrder(predictionTime, hasVelocityAvailable, p2, p3, p4);
+        //     SimpleTargetInfo predictedCicularTarget = PredictCircularMotion(predictionTime, hasVelocityAvailable, p2, p3, p4);
+
+        //     // 计算预测位置与实际位置的差距，单位：米/毫秒
+        //     linearPositionError = (predictedLinearTarget.Position - p1.Position).Length() / predictionTime * 1000;
+        //     circularPositionError = (predictedCicularTarget.Position - p1.Position).Length() / predictionTime * 1000;
+
+        //     // 计算线性和圆周预测的加权组合误差
+        //     Vector3D predictedLinear = predictedLinearTarget.Position;
+        //     Vector3D predictedCircular = predictedCicularTarget.Position;
+        //     Vector3D groundTruth = p1.Position;
+
+        //     double tempLinearWeight, tempCircularWeight;
+        //     if (SolveLinearCombination(predictedLinear, predictedCircular, groundTruth, out tempLinearWeight, out tempCircularWeight))
+        //     {
+        //         // 验证组合结果
+        //         Vector3D optimalCombination = predictedLinear * tempLinearWeight + predictedCircular * tempCircularWeight;
+        //         combinationError = (optimalCombination - groundTruth).Length() / predictionTime * 1000;
+
+        //         // 误差保护：如果组合误差比单独预测的最大值还大，则使用更好的单独预测
+        //         double maxIndividualError = Math.Max(linearPositionError, circularPositionError);
+        //         if (combinationError > maxIndividualError)
+        //         {
+        //             // 选择误差较小的预测方法，设置权重为完全相信该方法
+        //             if (linearPositionError <= circularPositionError)
+        //             {
+        //                 linearWeight = 1.0;
+        //                 circularWeight = 0.0;
+        //                 combinationError = linearPositionError; // 更新组合误差为较小的个体误差
+        //             }
+        //             else
+        //             {
+        //                 linearWeight = 0.0;
+        //                 circularWeight = 1.0;
+        //                 combinationError = circularPositionError; // 更新组合误差为较小的个体误差
+        //             }
+        //         }
+        //         else
+        //         {
+        //             // 组合效果良好，使用计算出的权重
+        //             linearWeight = tempLinearWeight;
+        //             circularWeight = tempCircularWeight;
+        //         }
+        //     }
+        //     else
+        //     {
+        //         // 求解失败，使用更好的单独预测方法
+        //         if (linearPositionError <= circularPositionError)
+        //         {
+        //             linearWeight = 1.0;
+        //             circularWeight = 0.0;
+        //             combinationError = linearPositionError;
+        //         }
+        //         else
+        //         {
+        //             linearWeight = 0.0;
+        //             circularWeight = 1.0;
+        //             combinationError = circularPositionError;
+        //         }
+        //     }
+        // }
+        #endregion
+
+        #region Utilities
+        /// <summary>
+        /// 全局3D最小二乘法求解线性组合参数（带约束条件）
+        /// </summary>
+        /// <param name="predictedLinear">线性预测位置</param>
+        /// <param name="predictedCircular">圆周预测位置</param>
+        /// <param name="groundTruth">真实位置</param>
+        /// <param name="linearWeight">输出：线性预测权重</param>
+        /// <param name="circularWeight">输出：圆周预测权重</param>
+        /// <returns>求解是否成功</returns>
+        public static bool SolveLinearCombination(Vector3D predictedLinear, Vector3D predictedCircular, Vector3D groundTruth,
+            out double linearWeight, out double circularWeight)
+        {
+            linearWeight = 0.618;
+            circularWeight = 0.382;
+
+            // 构建全局3D最小二乘法方程
+            // 目标：min ||L*predictedLinear + C*predictedCircular - groundTruth||²
+
+            // 计算矩阵元素 A^T*A 和 A^T*b
+            double a11 = predictedLinear.LengthSquared();                              // ||L||²
+            double a12 = Vector3D.Dot(predictedLinear, predictedCircular);             // L·C
+            double a22 = predictedCircular.LengthSquared();                            // ||C||²
+
+            double b1 = Vector3D.Dot(predictedLinear, groundTruth);                    // L·T
+            double b2 = Vector3D.Dot(predictedCircular, groundTruth);                  // C·T
+
+            // 检查矩阵条件数
+            double det = a11 * a22 - a12 * a12;
+            double trace = a11 + a22;
+            double conditionNumber = (Math.Abs(det) > 1e-15) ? trace / Math.Abs(det) : double.PositiveInfinity;
+
+            // 如果条件数过大，说明两个预测向量过于相似
+            if (Math.Abs(det) < 1e-12 || conditionNumber > 1e8)
+            {
+                return false; // 矩阵奇异或病态
+            }
+
+            // 求解无约束最小二乘问题
+            double L_unconstrained = (a22 * b1 - a12 * b2) / det;
+            double C_unconstrained = (a11 * b2 - a12 * b1) / det;
+
+            // 应用约束条件：L + C = 1
+            double norm = L_unconstrained + C_unconstrained;
+
+            if (Math.Abs(norm) > 1e-12)
+            {
+                // 归一化使权重和为1
+                linearWeight = L_unconstrained / norm;
+                circularWeight = C_unconstrained / norm;
+            }
+            else
+            {
+                // 如果无约束解的和接近0，使用默认权重
+                linearWeight = 0.618;
+                circularWeight = 0.382;
+            }
+
+            return true;
+        }
+
+
+        /// <summary>
+        /// 限制时间差最小值
+        /// </summary>
+        private double ClampTime(double dt)
+        {
+            return Math.Abs(dt) < TimeEpsilon ? TimeEpsilon : dt;
+        }
+
+        // Sigmoid激活函数
+        private double Sigmoid(double x)
+        {
+            return 1.0 / (1.0 + Math.Exp(-x));
+        }
+
+        /// <summary>
+        /// 获取当前速度
+        /// </summary>
+        /// <param name="p0">当前位置点</param>
+        /// <param name="p1">前一个位置点</param>
+        /// <param name="hasVelocityAvailable">是否有实测速度</param>
+        /// <returns>当前速度</returns>
+        private Vector3D GetCurrentVelocity(SimpleTargetInfo p0, SimpleTargetInfo p1, bool hasVelocityAvailable)
+        {
+            if (hasVelocityAvailable)
+            {
+                return p0.Velocity;
+            }
+            else
+            {
+                double dt = ClampTime((p0.TimeStamp - p1.TimeStamp) * 0.001);
+                return (p0.Position - p1.Position) / dt;
+            }
+        }
+
+        #endregion
+    }
+}

@@ -1,0 +1,10 @@
+is_global = true
+build_property.ProjectDir = C:\Users\Lenovo\Desktop\CSharp\AdvancedCustomTurretControl\
+build_property.ProjectDir = C:\Users\Lenovo\Desktop\CSharp\AdvancedCustomTurretControl\
+build_property.Mdk-IgnorePaths = obj\**\*;MDK\**\*;**\*.debug.cs
+build_property.RootNamespace = IngameScript
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 
+build_property.CsWinRTUseWindowsUIXamlProjections = false
+build_property.EffectiveAnalysisLevelStyle = 
+build_property.EnableCodeStyleSeverity = 
