@@ -1,6 +1,6 @@
 is_global = true
-build_property.ProjectDir = D:\CSharp\AdvancedCustomTurretControl\
-build_property.ProjectDir = D:\CSharp\AdvancedCustomTurretControl\
+build_property.ProjectDir = C:\Users\Lenovo\Desktop\CSharp\AdvancedCustomTurretControl\
+build_property.ProjectDir = C:\Users\Lenovo\Desktop\CSharp\AdvancedCustomTurretControl\
 build_property.Mdk-IgnorePaths = obj\**\*;MDK\**\*;**\*.debug.cs
 build_property.RootNamespace = IngameScript
 build_property.EnableComHosting = 
