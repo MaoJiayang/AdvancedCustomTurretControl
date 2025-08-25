@@ -19,7 +19,7 @@ namespace IngameScript
         private const string 方向机名称 = "方向机";     // 方位转子名称标签
         private const string 高低机名称 = "高低机";     // 俯仰转子名称标签
         private const string 基线武器标记 = "基线";       // 基线武器标记
-        private const double 角度容差 = 3.14 / 180 * 0.5;            // 角度容差(弧度)
+        private const double 角度容差 = 3.14 / 180 * 1;            // 角度容差(弧度)
         private const double 转子比例系数 = 30.0;         // 转子PID比例系数
         private const double 转子积分系数 = 0.0;          // 转子PID积分系数
         private const double 转子微分系数 = 0.0;          // 转子PID微分系数
@@ -123,7 +123,7 @@ namespace IngameScript
             轮射间隔 = (int)武器基础信息.X;
             轮射窗口长度 = (int)武器基础信息.Y;
             当前参考基线武器 = 默认基线武器 as IMyUserControllableGun;
-            Echo("高级转子武器控制系统已启动");
+            Echo("自定义炮塔控制系统已启动");
             Echo("使用命令：目标 X Y Z 设置目标坐标");
         }
 
@@ -340,6 +340,12 @@ namespace IngameScript
             {
                 缓存预测位置 = 计算预测位置();
             }
+            else
+            {
+                // 如果没有有效目标，将缓存预测位置设为1000m外，方向为前方
+                Vector3D 前方方向 = 当前控制器.WorldMatrix.Forward;
+                缓存预测位置 = 当前控制器.GetPosition() + 前方方向 * 1000.0;
+            }
         }
 
         private void 更新转子炮台控制()
@@ -378,11 +384,11 @@ namespace IngameScript
 
             检查并关闭超时武器();
 
-            if (已瞄准)
-            {
-                方位转子.TargetVelocityRad = 0;
-                俯仰转子.TargetVelocityRad = 0;
-            }
+            // if (已瞄准)
+            // {
+            //     方位转子.TargetVelocityRad = 0;
+            //     俯仰转子.TargetVelocityRad = 0;
+            // }
             if (目标在范围内 && 已瞄准)
             {
                 发射武器();
@@ -555,7 +561,7 @@ namespace IngameScript
                 Vector3D 新拦截点 = 目标信息.Position - 舰船位移;
 
                 // 检查预测收敛条件
-                if (Vector3D.Distance(拦截点, 新拦截点) < 2.5)
+                if (Vector3D.Distance(拦截点, 新拦截点) < 0.5)
                     break;
 
                 拦截点 = 新拦截点;
@@ -944,7 +950,7 @@ namespace IngameScript
         }
         private void 显示状态()
         {
-            Echo("=== 自定义炮塔火控系统 v1.3===");
+            Echo("=== 自定义炮塔火控系统 v1.3.2 ===");
             Echo($"炮塔编组: {炮塔编组?.Name ?? "未找到"}");
             Echo($"跳帧设置: {跳帧计数} | 弹速: {武器弹速:F0} m/s");
             Echo($"武器名称: {默认基线武器?.BlockDefinition.SubtypeId ?? "未找到"}");

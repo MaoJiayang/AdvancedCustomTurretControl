@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using VRageMath;
 using Sandbox.ModAPI.Ingame;
+using System.Numerics;
 
 namespace IngameScript
 {
@@ -12,20 +13,31 @@ namespace IngameScript
     {
         public Vector3D Position;
         public Vector3D Velocity;
-        public long TimeStamp; // 以毫秒为单位
-        public SimpleTargetInfo(Vector3D position, Vector3D velocity, long timeStamp)
+        public Vector3D Acceleration;
+        public long TimeStamp;
+
+        /// <summary>
+        /// 用于创建 SimpleTargetInfo 的构造函数
+        /// </summary>
+        /// <param name="position">位置信息，必须真实</param>
+        /// <param name="velocity">速度信息，可以为零</param>
+        /// <param name="acceleration">加速度信息，可以为零</param>
+        /// <param name="timeStamp">时间戳ms</param>
+        public SimpleTargetInfo(Vector3D position, Vector3D velocity, Vector3D acceleration, long timeStamp)
         {
             Position = position;
             Velocity = velocity;
+            Acceleration = acceleration;
             TimeStamp = timeStamp;
         }
 
-        // 从 MyDetectedEntityInfo 创建
+        // 从 MyDetectedEntityInfo 创建 由于缺少加速度信息，因此使用零向量填充
         public static SimpleTargetInfo FromDetectedInfo(MyDetectedEntityInfo info)
         {
             return new SimpleTargetInfo(
                 info.Position,
                 new Vector3D(info.Velocity),
+                Vector3D.Zero,
                 info.TimeStamp
             );
         }
@@ -52,14 +64,25 @@ namespace IngameScript
         
         public static CircularMotionParams Invalid => new CircularMotionParams { IsValid = false };
     }
-
+    
     public partial class TargetTracker : MyGridProgram
     {
         #region Fields and Constants
 
         public double circlingRadius = 0; // 目标当前环绕半径
-        public double linearWeight, circularWeight;
-        public double linearPositionError, circularPositionError, combinationError;
+        public double linearWeight = 0.5, circularWeight = 0.5;
+
+        /// <summary>
+        /// 单位：米每秒
+        /// </summary>
+        public double linearError, circularError;
+
+        /// <summary>
+        /// 单位：米每秒
+        /// </summary>
+        public double combinationError;
+
+        public double maxTargetAcceleration = 0; // 最大目标加速度（单位：m/s²）
         // 目标历史记录最大长度
         private readonly int _maxHistory;
         // 目标历史记录，最新数据放在链表头部
@@ -69,9 +92,10 @@ namespace IngameScript
 
         // 常量定义
         private const double TimeEpsilon = 1e-6; // 时间差最小值
-        private const double LinearThreshold = 1; // 线性运动检测阈值
+        private const double LinearThreshold = 0.01; // 线性运动检测阈值 sin θ＝0.01 约等于 θ≈0.57°
         private const double RadiusThreshold = 1e6; // 半径过大阈值
-    
+        private const double MaxAccResetThreshold = 20.0; // 误差超过20m/s时重置最大加速度记录
+
         #endregion
 
         #region Constructors
@@ -98,7 +122,7 @@ namespace IngameScript
         /// <summary>
         /// 添加一条新的目标数据到历史记录中，超过最大长度时自动清除最旧数据
         /// </summary>
-        public void UpdateTarget(SimpleTargetInfo target,bool hasVelocityAvailable = false)
+        public void UpdateTarget(SimpleTargetInfo target, bool hasVelocityAvailable = false)
         {
             _updateCount = (_updateCount + 1) % 2147483647;
             _history.AddFirst(target);
@@ -109,27 +133,45 @@ namespace IngameScript
             var p0 = _history.First;
             var p1 = _history.GetItemAt(index2);
             var p2 = _history.Last;
-            _circularMotionParams = CalculateCircularMotionParams(p0, p1, p2); 
-                       
+            _circularMotionParams = CalculateCircularMotionParams(p0, p1, p2);
+
         }
 
-        public void UpdateTarget(MyDetectedEntityInfo target,bool hasVelocityAvailable = false)
+        public void UpdateTarget(MyDetectedEntityInfo target, bool hasVelocityAvailable = false)
         {
             UpdateTarget(SimpleTargetInfo.FromDetectedInfo(target), hasVelocityAvailable);
         }
-
-        public void UpdateTarget(Vector3D position, Vector3D velocity, long timeStamp,bool hasVelocityAvailable = false)
+        public void UpdateTarget(Vector3D position, Vector3D velocity, long timeStamp, bool hasVelocityAvailable = false)
         {
-            UpdateTarget(new SimpleTargetInfo(position, velocity, timeStamp), hasVelocityAvailable);
+            UpdateTarget(new SimpleTargetInfo(position, velocity, Vector3D.Zero, timeStamp), hasVelocityAvailable);
         }
-
+        public void UpdateTarget(Vector3D position, long timeStamp, bool hasVelocityAvailable = false)
+        {
+            UpdateTarget(new SimpleTargetInfo(position, Vector3D.Zero, Vector3D.Zero, timeStamp), hasVelocityAvailable);
+        }
         /// <summary>
         /// 清空目标历史记录
         /// </summary>
         public void ClearHistory()
         {
+            maxTargetAcceleration = 0;
             _history.Clear();
         }
+        /// <summary>
+        /// 获取历史记录中指定索引的目标信息。
+        /// 索引<0时返回最新；索引>=Count时返回最旧；无历史时返回null
+        /// </summary>
+        public SimpleTargetInfo? GetTargetInfoAt(int index)
+        {
+            if (_history.Count == 0)
+                return null;
+            if (index < 0)
+                return _history.First;
+            if (index >= _history.Count)
+                return _history.Last;
+            return _history.GetItemAt(index);
+        }
+
         /// <summary>
         /// 返回当前历史记录中最新的目标数据（若存在）
         /// </summary>
@@ -158,7 +200,7 @@ namespace IngameScript
         {
             if (_history.Count == 0)
             {
-                return new SimpleTargetInfo(Vector3D.Zero, Vector3D.Zero, 0);
+                return new SimpleTargetInfo();
             }
 
             if (_history.Count <= 2)
@@ -173,8 +215,8 @@ namespace IngameScript
             var p0 = _history.First;
             var pm = _history.GetItemAt(index2);
             var pt = _history.Last;
-            // var p1 = _history.GetItemAt(1);
-            // var p2 = _history.GetItemAt(2);
+            var p1 = _history.GetItemAt(1);
+            var p2 = _history.GetItemAt(2);
 
             // 检查权重，避免不必要的计算
             bool useLinear = Math.Abs(linearWeight) > 1e-3;
@@ -186,13 +228,15 @@ namespace IngameScript
             if (useLinear && useCircular)
             {
                 // 两种预测都需要，进行加权组合
-                linearPrediction = PredictSecondOrder(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
+                linearPrediction = PredictSecondOrder(futureTimeMs, hasVelocityAvailable, p0, p1, p2);
+                // linearPrediction = PredictSecondOrder(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
                 circularPrediction = PredictCircularMotion(futureTimeMs, hasVelocityAvailable, p0, pm, pt);
 
                 Vector3D combinedPosition = linearPrediction.Position * linearWeight + circularPrediction.Position * circularWeight;
                 Vector3D combinedVelocity = linearPrediction.Velocity * linearWeight + circularPrediction.Velocity * circularWeight;
+                Vector3D combinedAcceleration = linearPrediction.Acceleration * linearWeight + circularPrediction.Acceleration * circularWeight;
 
-                return new SimpleTargetInfo(combinedPosition, combinedVelocity, p0.TimeStamp + futureTimeMs);
+                return new SimpleTargetInfo(combinedPosition, combinedVelocity, combinedAcceleration, p0.TimeStamp + futureTimeMs);
             }
             else if (useLinear)
             {
@@ -222,7 +266,7 @@ namespace IngameScript
             var current = _history.First;
             double dt = futureTimeMs * 0.001;
             Vector3D predictedPos = current.Position + current.Velocity * dt;
-            return new SimpleTargetInfo(predictedPos, current.Velocity, current.TimeStamp + futureTimeMs);
+            return new SimpleTargetInfo(predictedPos, current.Velocity, Vector3D.Zero, current.TimeStamp + futureTimeMs);
         }
 
         /// <summary>
@@ -247,7 +291,7 @@ namespace IngameScript
                 Vector3D acc2 = (p1.Velocity - p2.Velocity) / dt2;
 
                 // 计算加速度变化率(jerk)
-                jerk = (acc1 - acc2) / (dt1 + dt2 * 0.5); // 加权时间差
+                jerk = (acc1 - acc2) / (dt1 + dt2) * 0.5;
                 useThirdOrder = true;  // 有足够信息使用三阶预测
 
                 // 取当前加速度
@@ -260,23 +304,23 @@ namespace IngameScript
                 Vector3D vel2 = (p1.Position - p2.Position) / dt2;
 
                 currentVel = vel1;
-                acceleration = (vel1 - vel2) / dt1;
+                acceleration = (vel1 - vel2) / (dt1 + dt2) * 0.5;
             }
 
             // 预测计算
             double dt_predict = futureTimeMs * 0.001;
             Vector3D predictedPos, predictedVel;
-            
+
             if (useThirdOrder)
             {
                 // 三阶预测：p = p₀ + v₀·t + ½·a₀·t² + ⅙·j·t³
-                predictedPos = currentPos + 
-                            currentVel * dt_predict + 
+                predictedPos = currentPos +
+                            currentVel * dt_predict +
                             0.5 * acceleration * dt_predict * dt_predict +
-                            (1.0/6.0) * jerk * dt_predict * dt_predict * dt_predict;
-                            
+                            (1.0 / 6.0) * jerk * dt_predict * dt_predict * dt_predict;
+
                 // 预测速度：v = v₀ + a₀·t + ½·j·t²
-                predictedVel = currentVel + 
+                predictedVel = currentVel +
                             acceleration * dt_predict +
                             0.5 * jerk * dt_predict * dt_predict;
             }
@@ -287,7 +331,11 @@ namespace IngameScript
                 predictedVel = currentVel + acceleration * dt_predict;
             }
 
-            return new SimpleTargetInfo(predictedPos, predictedVel, p0.TimeStamp + futureTimeMs);
+            // 根据情况重置/更新最大加速度记录
+            if (combinationError >= MaxAccResetThreshold) maxTargetAcceleration = 0;
+            else maxTargetAcceleration = Math.Max(maxTargetAcceleration, acceleration.Length());
+
+            return new SimpleTargetInfo(predictedPos, predictedVel, acceleration, p0.TimeStamp + futureTimeMs);
         }
 
         /// <summary>
@@ -299,14 +347,17 @@ namespace IngameScript
         /// <returns>圆周运动参数</returns>
         private CircularMotionParams CalculateCircularMotionParams(SimpleTargetInfo p0, SimpleTargetInfo p1, SimpleTargetInfo p2)
         {
-            // 检测是否为线性运动
+            // 检测是否为近似共线（直线运动）
             Vector3D a = p1.Position - p0.Position;
             Vector3D b = p2.Position - p0.Position;
             Vector3D cross = Vector3D.Cross(a, b);
 
-            if (cross.LengthSquared() < LinearThreshold)
+            double a2 = a.LengthSquared();
+            double b2 = b.LengthSquared();
+            // cross² = |a|²·|b|²·sin²θ，归一化后判断 sin²θ < 阈值²
+            if (cross.LengthSquared() < a2 * b2 * LinearThreshold * LinearThreshold)
             {
-                return CircularMotionParams.Invalid; // 直线运动
+                return CircularMotionParams.Invalid; // 近似直线
             }
 
             // 计算外接圆参数
@@ -398,7 +449,10 @@ namespace IngameScript
             // 预测速度（旋转当前速度向量）
             Vector3D predictedVel = Vector3D.Transform(currentVel, rotation);
 
-            return new SimpleTargetInfo(predictedPos, predictedVel, p0.TimeStamp + futureTimeMs);
+            // 计算向心加速度向量（a = ω²·r，方向指向圆心）
+            Vector3D centripetalAcc = -circularParams.AngularVelocity * circularParams.AngularVelocity * rotatedRadius;
+
+            return new SimpleTargetInfo(predictedPos, predictedVel, centripetalAcc, p0.TimeStamp + futureTimeMs);
         }
 
         /// <summary>
@@ -411,9 +465,9 @@ namespace IngameScript
             // 历史记录检查（保持原有代码）
             if (_history.Count < 4)
             {
-                linearPositionError = 1145140721.0;
-                circularPositionError = 1145140721.0;
-                combinationError = 1145140721.0;
+                linearError = 1145.0;
+                circularError = 1145.0;
+                combinationError = 1145.0;
                 return;
             }
 
@@ -431,251 +485,75 @@ namespace IngameScript
             // if (index2 <= index1) index2 = index1 + 1;
 
             var p0 = _history.First; // 最新记录
-            // var p1 = _history.GetItemAt(1); // 第二新记录
-            // var p2 = _history.GetItemAt(2); // 第三新记录
-            // var p3 = _history.GetItemAt(3); // 最旧记录
+            var p1 = _history.GetItemAt(1); // 第二新记录
+            var p2 = _history.GetItemAt(2); // 第三新记录
+            var p3 = _history.GetItemAt(3); // 最旧记录
             var p3_1 = _history.GetItemAt(index3_1); // 大约1/3处
             var p3_2 = _history.GetItemAt(index3_2); // 大约2/3处
             var pt = _history.Last; // 最旧记录
 
             // 计算预测时间
             long predictionTimeCicular = p0.TimeStamp - p3_1.TimeStamp;
-            long predictionTimeLinear = p0.TimeStamp - p3_1.TimeStamp;
+            // long predictionTimeLinear = p0.TimeStamp - p3_1.TimeStamp;
+            long predictionTimeLinear = p0.TimeStamp - p1.TimeStamp;
 
             // 进行预测
-            SimpleTargetInfo predictedLinearTarget = PredictSecondOrder(predictionTimeLinear, hasVelocityAvailable, p3_1, p3_2, pt);
-            _circularMotionParams = CalculateCircularMotionParams(p3_1, p3_2, pt); 
+            // SimpleTargetInfo predictedLinearTarget = PredictSecondOrder(predictionTimeLinear, hasVelocityAvailable, p3_1, p3_2, pt);
+            SimpleTargetInfo predictedLinearTarget = PredictSecondOrder(predictionTimeLinear, hasVelocityAvailable, p1, p2, p3);
+            _circularMotionParams = CalculateCircularMotionParams(p3_1, p3_2, pt);
             SimpleTargetInfo predictedCircularTarget = PredictCircularMotion(predictionTimeCicular, hasVelocityAvailable, p3_1, p3_2, pt);
 
             // 计算各自的误差
-            linearPositionError = (predictedLinearTarget.Position - p0.Position).Length() / predictionTimeLinear * 1000;
-            circularPositionError = (predictedCircularTarget.Position - p0.Position).Length() / predictionTimeCicular * 1000;
-            
+            linearError = (predictedLinearTarget.Position - p0.Position).Length() / predictionTimeLinear * 1000;
+            circularError = (predictedCircularTarget.Position - p0.Position).Length() / predictionTimeCicular * 1000;
             // ----- 增量学习 -----
-            
-            // 学习参数
-            double learningRate = 0.05;   // 控制每次更新的影响强度
-            
-            // 计算误差比率与目标权重
-            double targetLinearWeight, targetCircularWeight;
-            
-            // 基于误差比例计算目标权重
-            double errorSum = linearPositionError + circularPositionError;
-            // 误差越小，权重越大（反比关系）
-            targetLinearWeight = circularPositionError / errorSum;
-            targetCircularWeight = linearPositionError / errorSum;  
 
+            // 学习参数
+            double learningRate = 0.1;   // 控制每次更新的影响强度
+            // 对误差进行Softmax得到目标权重
+            double[] LC = { linearError, circularError };
+            double[] targetWeightsLC = Softmax(LC);
+            double targetLinearWeight = targetWeightsLC[0];
+            double targetCircularWeight = targetWeightsLC[1];
+            // // 基于误差比例计算目标权重
+            // double errorSum = linearError + circularError;
+            // // 误差越小，权重越大（反比关系）
+            // targetLinearWeight = circularError / errorSum;
+            // targetCircularWeight = linearError / errorSum;
             // 使用学习率应用增量更新
             linearWeight = linearWeight * (1 - learningRate) + targetLinearWeight * learningRate;
             circularWeight = circularWeight * (1 - learningRate) + targetCircularWeight * learningRate;
 
-            // 归一化确保权重和为1
-            double weightSum = linearWeight + circularWeight;
-            if (weightSum > 0)
-            {
-                linearWeight /= weightSum;
-                circularWeight /= weightSum;
-            }
-            else
-            {
-                // 防御性编程
-                linearWeight = 1;
-                circularWeight = 0;
-            }
 
             // 计算组合预测误差
-            Vector3D combinedPosition = predictedLinearTarget.Position * linearWeight + 
+            Vector3D combinedPosition = predictedLinearTarget.Position * linearWeight +
                                     predictedCircularTarget.Position * circularWeight;
-            combinationError = (combinedPosition - p0.Position).Length();// / predictionTimeCicular * 1000;
-            
+            combinationError = (combinedPosition - p0.Position).Length() / predictionTimeCicular * 1000;
+
             // 异常保护
-            double minIndividualError = Math.Min(linearPositionError, circularPositionError);
-            if (combinationError > minIndividualError)
-            {
-                if (linearPositionError <= circularPositionError)
-                {
-                    linearWeight = 1.0;
-                    circularWeight = 0.0;
-                    combinationError = linearPositionError;
-                }
-                else
-                {
-                    linearWeight = 0.0;
-                    circularWeight = 1.0;
-                    combinationError = circularPositionError;
-                }
-            }
+            // double minIndividualError = Math.Min(linearError, circularError);
+            // if (combinationError > minIndividualError)
+            // {
+            //     // linearWeight = 1.0;
+            //     // circularWeight = 0.0;
+            //     combinationError = linearError;
+            //     if (linearError <= circularError)
+            //     {
+            //         linearWeight = 1.0;
+            //         circularWeight = 0.0;
+            //         combinationError = linearError;
+            //     }
+            //     else
+            //     {
+            //         linearWeight = 0.0;
+            //         circularWeight = 1.0;
+            //         combinationError = circularError;
+            //     }
+            // }
         }
-        // /// <summary>
-        // /// 衡量预测性能的方法-数值版
-        // /// </summary>
-        // /// <param name="hasVelocityAvailable">是否有实测速度信息</param>
-        // /// <returns>预测误差的模长，如果数据不足则返回-1</returns>
-        // private void EvaluatePredictionPerformance(bool hasVelocityAvailable = false)
-        // {
-        //     if (_history.Count < 4)
-        //     {
-        //         linearPositionError = 114514.0;
-        //         circularPositionError = 114514.0;
-        //         combinationError = 114514.0;
-        //         return;
-        //     }
-
-        // int historyLength = _history.Count;
-        // // 计算均匀分布的索引位置
-        // int index2 = historyLength / 3;              // 大约1/3处
-        // int index3 = historyLength * 2 / 3;          // 大约2/3处
-        // // 确保索引不重复
-        // if (index2 == 0) index2 = 1;
-        // if (index3 <= index2) index3 = index2 + 1;
-
-        // // 获取节点1（最新记录）
-        // var node1 = _history.First;
-        // // 获取节点2
-        // var node2 = _history.First;
-        // for (int i = 0; i < index2; i++)
-        //     node2 = node2.Next;
-        // // 获取节点3
-        // var node3 = _history.First;
-        // for (int i = 0; i < index3; i++)
-        //     node3 = node3.Next;
-        // // 获取节点4（最旧记录）
-        // var node4 = _history.Last;
-
-        // var p1 = node1.Value;
-        // var p2 = node2.Value;
-        // var p3 = node3.Value;
-        // var p4 = node4.Value;
-
-        //     // 计算从记录2时刻到记录1时刻的预测时间
-        //     long predictionTime = p1.TimeStamp - p2.TimeStamp;
-
-        //     // 使用记录2,3,4预测记录1时刻的位置（不依赖类的历史记录状态）
-        //     SimpleTargetInfo predictedLinearTarget = PredictSecondOrder(predictionTime, hasVelocityAvailable, p2, p3, p4);
-        //     SimpleTargetInfo predictedCicularTarget = PredictCircularMotion(predictionTime, hasVelocityAvailable, p2, p3, p4);
-
-        //     // 计算预测位置与实际位置的差距，单位：米/毫秒
-        //     linearPositionError = (predictedLinearTarget.Position - p1.Position).Length() / predictionTime * 1000;
-        //     circularPositionError = (predictedCicularTarget.Position - p1.Position).Length() / predictionTime * 1000;
-
-        //     // 计算线性和圆周预测的加权组合误差
-        //     Vector3D predictedLinear = predictedLinearTarget.Position;
-        //     Vector3D predictedCircular = predictedCicularTarget.Position;
-        //     Vector3D groundTruth = p1.Position;
-
-        //     double tempLinearWeight, tempCircularWeight;
-        //     if (SolveLinearCombination(predictedLinear, predictedCircular, groundTruth, out tempLinearWeight, out tempCircularWeight))
-        //     {
-        //         // 验证组合结果
-        //         Vector3D optimalCombination = predictedLinear * tempLinearWeight + predictedCircular * tempCircularWeight;
-        //         combinationError = (optimalCombination - groundTruth).Length() / predictionTime * 1000;
-
-        //         // 误差保护：如果组合误差比单独预测的最大值还大，则使用更好的单独预测
-        //         double maxIndividualError = Math.Max(linearPositionError, circularPositionError);
-        //         if (combinationError > maxIndividualError)
-        //         {
-        //             // 选择误差较小的预测方法，设置权重为完全相信该方法
-        //             if (linearPositionError <= circularPositionError)
-        //             {
-        //                 linearWeight = 1.0;
-        //                 circularWeight = 0.0;
-        //                 combinationError = linearPositionError; // 更新组合误差为较小的个体误差
-        //             }
-        //             else
-        //             {
-        //                 linearWeight = 0.0;
-        //                 circularWeight = 1.0;
-        //                 combinationError = circularPositionError; // 更新组合误差为较小的个体误差
-        //             }
-        //         }
-        //         else
-        //         {
-        //             // 组合效果良好，使用计算出的权重
-        //             linearWeight = tempLinearWeight;
-        //             circularWeight = tempCircularWeight;
-        //         }
-        //     }
-        //     else
-        //     {
-        //         // 求解失败，使用更好的单独预测方法
-        //         if (linearPositionError <= circularPositionError)
-        //         {
-        //             linearWeight = 1.0;
-        //             circularWeight = 0.0;
-        //             combinationError = linearPositionError;
-        //         }
-        //         else
-        //         {
-        //             linearWeight = 0.0;
-        //             circularWeight = 1.0;
-        //             combinationError = circularPositionError;
-        //         }
-        //     }
-        // }
         #endregion
 
         #region Utilities
-        /// <summary>
-        /// 全局3D最小二乘法求解线性组合参数（带约束条件）
-        /// </summary>
-        /// <param name="predictedLinear">线性预测位置</param>
-        /// <param name="predictedCircular">圆周预测位置</param>
-        /// <param name="groundTruth">真实位置</param>
-        /// <param name="linearWeight">输出：线性预测权重</param>
-        /// <param name="circularWeight">输出：圆周预测权重</param>
-        /// <returns>求解是否成功</returns>
-        public static bool SolveLinearCombination(Vector3D predictedLinear, Vector3D predictedCircular, Vector3D groundTruth,
-            out double linearWeight, out double circularWeight)
-        {
-            linearWeight = 0.618;
-            circularWeight = 0.382;
-
-            // 构建全局3D最小二乘法方程
-            // 目标：min ||L*predictedLinear + C*predictedCircular - groundTruth||²
-
-            // 计算矩阵元素 A^T*A 和 A^T*b
-            double a11 = predictedLinear.LengthSquared();                              // ||L||²
-            double a12 = Vector3D.Dot(predictedLinear, predictedCircular);             // L·C
-            double a22 = predictedCircular.LengthSquared();                            // ||C||²
-
-            double b1 = Vector3D.Dot(predictedLinear, groundTruth);                    // L·T
-            double b2 = Vector3D.Dot(predictedCircular, groundTruth);                  // C·T
-
-            // 检查矩阵条件数
-            double det = a11 * a22 - a12 * a12;
-            double trace = a11 + a22;
-            double conditionNumber = (Math.Abs(det) > 1e-15) ? trace / Math.Abs(det) : double.PositiveInfinity;
-
-            // 如果条件数过大，说明两个预测向量过于相似
-            if (Math.Abs(det) < 1e-12 || conditionNumber > 1e8)
-            {
-                return false; // 矩阵奇异或病态
-            }
-
-            // 求解无约束最小二乘问题
-            double L_unconstrained = (a22 * b1 - a12 * b2) / det;
-            double C_unconstrained = (a11 * b2 - a12 * b1) / det;
-
-            // 应用约束条件：L + C = 1
-            double norm = L_unconstrained + C_unconstrained;
-
-            if (Math.Abs(norm) > 1e-12)
-            {
-                // 归一化使权重和为1
-                linearWeight = L_unconstrained / norm;
-                circularWeight = C_unconstrained / norm;
-            }
-            else
-            {
-                // 如果无约束解的和接近0，使用默认权重
-                linearWeight = 0.618;
-                circularWeight = 0.382;
-            }
-
-            return true;
-        }
-
-
         /// <summary>
         /// 限制时间差最小值
         /// </summary>
@@ -684,11 +562,48 @@ namespace IngameScript
             return Math.Abs(dt) < TimeEpsilon ? TimeEpsilon : dt;
         }
 
-        // Sigmoid激活函数
-        private double Sigmoid(double x)
+        /// <summary>
+        /// Softmax
+        /// </summary>
+        /// <param name="errors">数组</param>
+        /// <param name="temperature">温度参数，默认为1.0</param>
+        /// <returns>Softmax 归一化后的权重数组</returns>
+        private double[] Softmax(double[] errors, double temperature = 0.2)
         {
-            return 1.0 / (1.0 + Math.Exp(-x));
+            if (errors == null || errors.Length == 0)
+                throw new ArgumentException("Errors array cannot be null or empty.");
+
+            // Step 1: 找到最大值用于数值稳定
+            double maxError = double.MinValue;
+            foreach (var e in errors)
+            {
+                if (e > maxError) maxError = e;
+            }
+
+            // Step 2: 计算指数部分
+            double[] expValues = new double[errors.Length];
+            for (int i = 0; i < errors.Length; i++)
+            {
+                expValues[i] = Math.Exp(-(errors[i] - maxError) / temperature);
+            }
+
+            // Step 3: 计算总和
+            double sumExp = 0;
+            for (int i = 0; i < expValues.Length; i++)
+            {
+                sumExp += expValues[i];
+            }
+
+            // Step 4: 归一化
+            double[] weights = new double[errors.Length];
+            for (int i = 0; i < weights.Length; i++)
+            {
+                weights[i] = expValues[i] / sumExp;
+            }
+
+            return weights;
         }
+
 
         /// <summary>
         /// 获取当前速度
